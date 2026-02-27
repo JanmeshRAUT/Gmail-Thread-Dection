@@ -7,6 +7,9 @@ export interface ThreatAnalysis {
   summary: string;
   threats: string[];
   recommendation: string;
+  isSpam?: boolean;
+  spamScore?: number;
+  spamReason?: string;
 }
 
 export async function analyzeEmail(content: string, attachments: { filename: string, mimeType: string, data?: string }[] = []) {
