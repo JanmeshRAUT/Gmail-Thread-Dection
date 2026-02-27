@@ -1,0 +1,5 @@
+{
+  "name": "Gmail Threat Guard",
+  "description": "AI-powered threat detection for Gmail content and attachments using Gemini.",
+  "requestFramePermissions": []
+}
