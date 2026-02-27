@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Shield, Mail, AlertTriangle, CheckCircle, Search, LogOut, ExternalLink, Loader2, ChevronRight, AlertCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { analyzeEmail, ThreatAnalysis } from './services/geminiService';
+import { ThreatAnalysis } from './services/geminiService';
 import { cn, getEmailBody, getHeader, getAttachments } from './utils';
 import ReactMarkdown from 'react-markdown';
 
@@ -35,6 +35,9 @@ export default function App() {
   useEffect(() => {
     if (isAuthenticated) {
       fetchEmails();
+      // Auto-refresh emails every 30 seconds
+      const interval = setInterval(fetchEmails, 30000);
+      return () => clearInterval(interval);
     }
   }, [isAuthenticated]);
 
@@ -87,15 +90,47 @@ export default function App() {
   };
 
   const handleAnalyze = async (email: Email) => {
+    console.log("🔍 Analyze button clicked for email:", email.id);
     setIsAnalyzing(true);
     setAnalysis(null);
     try {
       const body = getEmailBody(email.payload);
       const attachments = getAttachments(email.payload);
-      const result = await analyzeEmail(body, attachments);
+      
+      console.log("� Email content length:", body.length);
+      console.log("📎 Attachments count:", attachments.length);
+      
+      console.log("📤 Sending to backend for analysis...");
+      // Call backend API instead of client-side analysis
+      const res = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: body, attachments })
+      });
+      
+      console.log("📥 Response status:", res.status);
+      
+      if (!res.ok) {
+        const error = await res.json();
+        console.error('❌ Analysis API error:', error);
+        alert(`Analysis failed: ${error.details || error.error}`);
+        return;
+      }
+      
+      const result = await res.json();
+      console.log("✓ Analysis complete:", result);
+      
+      // Validate response
+      if (!result.riskLevel) {
+        console.error("❌ Invalid response - missing riskLevel");
+        alert("Invalid analysis response - missing risk level");
+        return;
+      }
+      
       setAnalysis(result);
-    } catch (e) {
-      console.error('Analysis failed', e);
+    } catch (e: any) {
+      console.error('❌ Analysis failed with exception:', e);
+      alert(`Analysis error: ${e.message}`);
     } finally {
       setIsAnalyzing(false);
     }
@@ -252,7 +287,7 @@ export default function App() {
                     <button
                       onClick={() => handleAnalyze(selectedEmail)}
                       disabled={isAnalyzing}
-                      className="bg-emerald-500 hover:bg-emerald-400 text-black font-bold py-3 px-6 rounded-xl transition-all flex items-center gap-2 disabled:opacity-50 shadow-lg shadow-emerald-500/20"
+                      className="bg-emerald-500 hover:bg-emerald-400 disabled:bg-emerald-600 text-black font-bold py-3 px-6 rounded-xl transition-all flex items-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed cursor-pointer shadow-lg shadow-emerald-500/20"
                     >
                       {isAnalyzing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Shield className="w-5 h-5" />}
                       {isAnalyzing ? 'Analyzing...' : 'Analyze Threat'}
@@ -328,6 +363,55 @@ export default function App() {
                         <h4 className="text-sm font-bold text-zinc-400 uppercase tracking-wider mb-4">Recommendation</h4>
                         <p className="text-zinc-200 font-medium">{analysis.recommendation}</p>
                       </div>
+
+                      {/* Spam Detection */}
+                      {analysis.isSpam !== undefined && (
+                        <div className={cn(
+                          "p-6 rounded-2xl border flex items-start gap-6",
+                          analysis.isSpam 
+                            ? "bg-red-500/10 border-red-500/30" 
+                            : "bg-emerald-500/10 border-emerald-500/30"
+                        )}>
+                          <div className={cn(
+                            "w-16 h-16 rounded-2xl flex items-center justify-center shrink-0",
+                            analysis.isSpam ? "bg-red-500/20" : "bg-emerald-500/20"
+                          )}>
+                            {analysis.isSpam ? (
+                              <AlertTriangle className={cn("w-8 h-8", analysis.isSpam ? "text-red-400" : "text-emerald-400")} />
+                            ) : (
+                              <CheckCircle className="w-8 h-8 text-emerald-400" />
+                            )}
+                          </div>
+                          <div className="flex-1">
+                            <div className={cn(
+                              "text-sm font-bold uppercase tracking-widest mb-2",
+                              analysis.isSpam ? "text-red-400" : "text-emerald-400"
+                            )}>
+                              {analysis.isSpam ? "⚠️ SPAM DETECTED" : "✓ NOT SPAM"}
+                            </div>
+                            <div className="flex items-center gap-4 mb-3">
+                              <div className="flex-1">
+                                <div className="text-xs text-zinc-400 mb-1">Spam Score</div>
+                                <div className="w-full bg-zinc-700 rounded-full h-2 overflow-hidden">
+                                  <div 
+                                    className={cn(
+                                      "h-full transition-all",
+                                      (analysis.spamScore || 0) < 30 ? "bg-emerald-500" :
+                                      (analysis.spamScore || 0) < 60 ? "bg-yellow-500" :
+                                      "bg-red-500"
+                                    )}
+                                    style={{ width: `${analysis.spamScore || 0}%` }}
+                                  />
+                                </div>
+                                <div className="text-xs text-zinc-400 mt-1">{analysis.spamScore || 0}/100</div>
+                              </div>
+                            </div>
+                            {analysis.spamReason && (
+                              <p className="text-sm text-zinc-300">{analysis.spamReason}</p>
+                            )}
+                          </div>
+                        </div>
+                      )}
 
                       <div className="pt-8 border-t border-zinc-800">
                         <h4 className="text-sm font-bold text-zinc-500 uppercase tracking-wider mb-4">Original Content</h4>
