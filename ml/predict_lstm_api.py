@@ -1,198 +1,195 @@
+"""
+Character-Level LSTM — PyTorch Prediction Module
+==================================================
+Loads the trained .pt checkpoint and performs inference on URLs.
+Must match the architecture in train_lstm.py exactly.
+"""
+
+import sys, os
+
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+
+import warnings
+warnings.filterwarnings("ignore")
+
 import numpy as np
-import pandas as pd
-from tensorflow.keras.models import load_model
 import joblib
-import re
+import torch
+import torch.nn as nn
+
+# ─── Constants (must match train_lstm.py) ─────────────────────────────────────
+MAX_URL_LEN   = 100
+EMBEDDING_DIM = 32
+LSTM_HIDDEN   = 64         # UPDATED: Regularized for better generalization
+
+# ─── Risk thresholds ──────────────────────────────────────────────────────────
+THRESH_CRITICAL = 0.85
+THRESH_HIGH     = 0.65
+THRESH_MEDIUM   = 0.45
+DECISION_THR    = 0.45   # probability above this → phishing
+
+# ─── PyTorch model definition (mirrors train_lstm.py) ─────────────────────────
+class PhishingLSTM(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(
+            embed_dim, hidden_dim,
+            batch_first=True,
+            dropout=0.4,                    # UPDATED: Increased for regularization
+            bidirectional=True,
+        )
+        self.dropout1 = nn.Dropout(0.5)     # UPDATED: Increased dropout layers
+        self.dropout2 = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(hidden_dim * 2, 32)     # UPDATED: Reduced from 64 to 32
+        self.fc2 = nn.Linear(32, 1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        emb    = self.embedding(x)
+        out, _ = self.lstm(emb)
+        pooled = out.max(dim=1).values
+        pooled = self.dropout1(pooled)
+        hidden = self.fc1(pooled)
+        hidden = self.relu(hidden)
+        hidden = self.dropout2(hidden)      # UPDATED: Added dropout after ReLU
+        return self.fc2(hidden).squeeze(1)
+
 
 class PhishingDetector:
-    """LSTM-based phishing URL detection"""
-    
-    def __init__(self, model_path='ml/models/lstm_model.keras', 
-                 label_encoder_path='ml/models/label_encoder.pkl',
-                 scaler_path='ml/models/scaler.pkl',
-                 feature_names_path='ml/models/feature_names.pkl'):
-        """Load trained model and preprocessing artifacts"""
+    """Load trained PyTorch LSTM and run phishing predictions."""
+
+    def __init__(self, model_path: str = None, char2idx_path: str = None):
+        ml_dir        = os.path.dirname(os.path.abspath(__file__))
+        model_path    = model_path    or os.path.join(ml_dir, "models", "lstm_model.pt")
+        char2idx_path = char2idx_path or os.path.join(ml_dir, "models", "char2idx.pkl")
+
+        self.device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[*] Loading GPU-trained LSTM model on {self.device} ...")
+
+        checkpoint      = torch.load(model_path, map_location=self.device)
+        vocab_size      = checkpoint["vocab_size"]
+        embed_dim       = checkpoint.get("embed_dim",  EMBEDDING_DIM)
+        hidden_dim      = checkpoint.get("hidden_dim", LSTM_HIDDEN)
+
+        self.model = PhishingLSTM(vocab_size, embed_dim, hidden_dim).to(self.device)
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.model.eval()
+
+        self.char2idx = joblib.load(char2idx_path)
+        self.max_len  = MAX_URL_LEN
+        print(f"[✓] GPU-trained model ready!")
+        print(f"    Device: {self.device} | Vocab: {vocab_size} | Hidden dim: {hidden_dim}")
+        print(f"    Regularization: Dropout(0.5) + L2 penalty | Training data: 300k URLs")
+
+    # ── Tokenisation ───────────────────────────────────────────────────────────
+    def _tokenise(self, url: str) -> list:
+        seq = [self.char2idx.get(c, 1) for c in str(url)[:self.max_len]]
+        seq += [0] * (self.max_len - len(seq))
+        return seq[:self.max_len]
+
+    # ── Risk mapping ───────────────────────────────────────────────────────────
+    @staticmethod
+    def _risk(prob: float) -> str:
+        if prob >= THRESH_CRITICAL: return "CRITICAL"
+        if prob >= THRESH_HIGH:     return "HIGH"
+        if prob >= THRESH_MEDIUM:   return "MEDIUM"
+        return "LOW"
+
+    # ── Single prediction ──────────────────────────────────────────────────────
+    def predict(self, url: str, threshold: float = DECISION_THR) -> dict:
         try:
-            self.model = load_model(model_path)
-            self.label_encoder = joblib.load(label_encoder_path)
-            self.scaler = joblib.load(scaler_path)
-            self.feature_names = joblib.load(feature_names_path)
-            print("✓ Model loaded successfully")
-        except Exception as e:
-            print(f"✗ Error loading model: {str(e)}")
-            raise
-    
-    def extract_features(self, url):
-        """Extract 13 features from URL"""
-        try:
-            url_str = str(url).strip()
-            features = {
-                'url_length': len(url_str),
-                'num_dots': url_str.count('.'),
-                'num_dashes': url_str.count('-'),
-                'num_underscores': url_str.count('_'),
-                'num_slashes': url_str.count('/'),
-                'num_at': url_str.count('@'),
-                'num_question': url_str.count('?'),
-                'num_equals': url_str.count('='),
-                'num_ampersand': url_str.count('&'),
-                'num_hash': url_str.count('#'),
-                'num_percent': url_str.count('%'),
-                'num_digits': sum(1 for c in url_str if c.isdigit()),
-                'num_special': sum(1 for c in url_str if not c.isalnum() and c != '/'),
-            }
-            return features
-        except Exception as e:
-            print(f"✗ Error extracting features: {str(e)}")
-            return {key: 0 for key in ['url_length', 'num_dots', 'num_dashes', 'num_underscores', 
-                                        'num_slashes', 'num_at', 'num_question', 'num_equals', 
-                                        'num_ampersand', 'num_hash', 'num_percent', 'num_digits', 'num_special']}
-    
-    def predict(self, url, threshold=0.5):
-        """
-        Predict if URL is phishing or benign
-        
-        Args:
-            url (str): URL to analyze
-            threshold (float): Decision threshold (default=0.5)
-        
-        Returns:
-            dict: Prediction results
-        """
-        try:
-            # Extract features
-            features_dict = self.extract_features(url)
-            features_array = np.array([features_dict[key] for key in self.feature_names])
-            
-            # Normalize
-            features_scaled = self.scaler.transform(features_array.reshape(1, -1))
-            
-            # Reshape for LSTM (1 sample, 20 timesteps, 13 features)
-            X_lstm = np.repeat(features_scaled[:, np.newaxis, :], 20, axis=1)
-            
-            # Predict
-            probability = self.model.predict(X_lstm, verbose=0)[0][0]
-            
-            # Use threshold to determine class
-            is_phishing = probability >= threshold
-            prediction_class = 1 if is_phishing else 0
-            
-            # Decode label
-            label = self.label_encoder.inverse_transform([prediction_class])[0]
-            
-            # Risk assessment
-            if probability >= 0.8:
-                risk_level = "CRITICAL"
-            elif probability >= 0.6:
-                risk_level = "HIGH"
-            elif probability >= 0.4:
-                risk_level = "MEDIUM"
-            else:
-                risk_level = "LOW"
-            
+            seq  = torch.tensor([self._tokenise(url)], dtype=torch.long).to(self.device)
+            with torch.no_grad():
+                logit = self.model(seq)
+                prob  = float(torch.sigmoid(logit).item())
+
+            is_phishing = prob >= threshold
             return {
-                'url': url,
-                'is_phishing': bool(is_phishing),
-                'probability': float(probability),
-                'prediction_class': int(prediction_class),
-                'label': str(label),
-                'risk_level': risk_level,
-                'confidence': float(max(probability, 1 - probability)),
-                'features': features_dict
+                "url":              url,
+                "is_phishing":      is_phishing,
+                "probability":      prob,
+                "prediction_class": int(is_phishing),
+                "label":            "phishing" if is_phishing else "benign",
+                "risk_level":       self._risk(prob),
+                "confidence":       float(max(prob, 1 - prob)),
             }
-        
-        except Exception as e:
+        except Exception as exc:
+            print(f"[!] predict error for {url}: {exc}")
             return {
-                'url': url,
-                'error': str(e),
-                'is_phishing': None,
-                'probability': None,
-                'risk_level': 'UNKNOWN'
+                "url": url, "error": str(exc),
+                "is_phishing": None, "probability": None, "risk_level": "UNKNOWN",
             }
-    
-    def predict_batch(self, urls, threshold=0.5):
-        """
-        Predict for multiple URLs
-        
-        Args:
-            urls (list): List of URLs
-            threshold (float): Decision threshold
-        
-        Returns:
-            list: List of prediction results
-        """
-        return [self.predict(url, threshold) for url in urls]
-    
-    def explain_prediction(self, url):
-        """
-        Explain what features contributed to the prediction
-        
-        Args:
-            url (str): URL to analyze
-        
-        Returns:
-            dict: Detailed analysis
-        """
-        prediction = self.predict(url)
-        features = prediction.get('features', {})
-        
-        # Identify high-risk features
-        high_risk_features = {
-            'num_at': 'Multiple @ symbols (phishing indicator)',
-            'num_question': 'Multiple query parameters',
-            'num_equals': 'Multiple = signs in URL',
-            'num_percent': 'URL encoding detected',
-            'url_length': 'Unusually long URL',
-            'num_underscores': 'Underscores in domain',
-            'num_dashes': 'Multiple hyphens (domain mimicking)'
-        }
-        
-        risk_factors = []
-        for feature, risk_description in high_risk_features.items():
-            if features.get(feature, 0) > 0:
-                risk_factors.append({
-                    'feature': feature,
-                    'value': features[feature],
-                    'risk_description': risk_description
-                })
-        
+
+    # ── Batch prediction ───────────────────────────────────────────────────────
+    def predict_batch(self, urls: list, threshold: float = DECISION_THR) -> list:
+        if not urls:
+            return []
+        try:
+            X = torch.tensor(
+                [self._tokenise(u) for u in urls], dtype=torch.long
+            ).to(self.device)
+            with torch.no_grad():
+                probs = torch.sigmoid(self.model(X)).cpu().numpy()
+
+            return [
+                {
+                    "url":              url,
+                    "is_phishing":      float(p) >= threshold,
+                    "probability":      float(p),
+                    "prediction_class": int(float(p) >= threshold),
+                    "label":            "phishing" if float(p) >= threshold else "benign",
+                    "risk_level":       self._risk(float(p)),
+                    "confidence":       float(max(float(p), 1 - float(p))),
+                }
+                for url, p in zip(urls, probs)
+            ]
+        except Exception as exc:
+            return [self.predict(u, threshold) for u in urls]
+
+    # ── Explainability ─────────────────────────────────────────────────────────
+    def explain_prediction(self, url: str) -> dict:
+        result  = self.predict(url)
+        url_str = str(url)
+        patterns = []
+        if "@" in url_str:
+            patterns.append("@ symbol detected — credential redirection risk")
+        if url_str.count("-") > 3:
+            patterns.append(f"Excessive hyphens ({url_str.count('-')}) — domain spoofing")
+        if len(url_str) > 75:
+            patterns.append(f"Long URL ({len(url_str)} chars) — obfuscation risk")
+        if url_str.count("%") > 2:
+            patterns.append("Heavy URL encoding — possible obfuscation")
+        if any(k in url_str.lower() for k in ["login","verify","secure","confirm","update","account"]):
+            patterns.append("Phishing keyword found in URL path")
         return {
-            'url': url,
-            'prediction': prediction,
-            'risk_factors': sorted(risk_factors, key=lambda x: x['value'], reverse=True),
-            'summary': f"URL classified as {prediction['label'].upper()} with {prediction['risk_level']} risk"
+            "url": url,
+            "prediction": result,
+            "suspicious_patterns": patterns,
+            "summary": (
+                f"URL classified as {result['label'].upper()} with {result['risk_level']} risk "
+                f"(confidence {result['confidence']:.1%})"
+            ),
         }
 
 
-def test_detector():
-    """Test the detector with sample URLs"""
-    detector = PhishingDetector()
-    
-    test_urls = [
-        'https://www.google.com',
-        'https://www.facebook.com',
-        'https://www.github.com',
-        'http://verify-your-account-click-here.xyz',
-        'https://account-update-required-confirm-password.suspicious.com',
-        'https://apple-id-verify.site/login?user=john@email.com&redirect=%2F',
-    ]
-    
-    print("\n" + "="*80)
-    print("PHISHING DETECTOR TEST")
-    print("="*80)
-    
-    for url in test_urls:
-        result = detector.predict(url)
-        print(f"\n🔗 URL: {url}")
-        print(f"   Label: {result['label'].upper()}")
-        print(f"   Risk Level: {result['risk_level']}")
-        print(f"   Confidence: {result['confidence']:.2%}")
-        print(f"   Probability: {result['probability']:.4f}")
-
-
+# ── Quick self-test ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Initialize detector
-    detector = PhishingDetector()
-    
-    # Test with sample URLs
-    test_detector()
+    d = PhishingDetector()
+    tests = [
+        "https://www.google.com",
+        "https://github.com/openai/openai-python",
+        "http://verify-your-account-click-here.xyz",
+        "https://paypal-secure-confirm.malicious.ru/reset",
+        "https://apple-id-verify.site/login?user=john@email.com&redirect=%2F",
+    ]
+    print("\n" + "="*65)
+    print("PyTorch LSTM — SELF-TEST")
+    print("="*65)
+    for url in tests:
+        r = d.predict(url)
+        flag = "🚨" if r["is_phishing"] else "✅"
+        print(f"{flag} [{r['risk_level']:8s}] p={r['probability']:.3f}  {url}")
