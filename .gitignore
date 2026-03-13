@@ -6,3 +6,15 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Large data files (contain test data with secret-like patterns)
+ml/data/*.csv
+ml/data/*.pkl
+
+# Large model files
+ml/models/*.keras
+ml/models/*.pt
+
+# Python cache
+ml/__pycache__/
+ml/data/__pycache__/
